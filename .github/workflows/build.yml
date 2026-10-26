@@ -1,0 +1,43 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Generate Android project files
+        run: flutter create --org com.app --project-name camfind --platforms=android .
+
+      - name: Add Firebase packages
+        run: flutter pub add firebase_core cloud_firestore firebase_auth
+
+      - name: Android settings
+        run: |
+          sed -i 's/flutter.minSdkVersion/23/' android/app/build.gradle*
+          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <application|' android/app/src/main/AndroidManifest.xml
+
+      - name: Build release APK
+        run: flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: campusfind-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
