@@ -1,8 +1,13 @@
+import 'dart:convert';
+import 'dart:math';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 const firebaseOptions = FirebaseOptions(
   apiKey: 'AIzaSyDfLzlN57MJ0dJ1igniLraSmehKtyffT3I',
@@ -122,6 +127,68 @@ ButtonStyle bigButton(Color color) {
     minimumSize: const Size.fromHeight(52),
     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
     textStyle: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+  );
+}
+
+String levelFor(int karma) =>
+    karma >= 50 ? 'Legend' : (karma >= 20 ? 'Campus Hero' : 'Rookie');
+
+/// Picks a photo and returns it as a small base64 string (kept under
+/// Firestore's 1 MB document limit by resizing and compressing).
+Future<String?> pickPhoto(BuildContext context) async {
+  final src = await showModalBottomSheet<ImageSource>(
+    context: context,
+    builder: (ctx) => SafeArea(
+      child: Wrap(
+        children: [
+          ListTile(
+            leading: const Icon(Icons.photo_camera_outlined),
+            title: const Text('Take a photo'),
+            onTap: () => Navigator.pop(ctx, ImageSource.camera),
+          ),
+          ListTile(
+            leading: const Icon(Icons.photo_library_outlined),
+            title: const Text('Choose from gallery'),
+            onTap: () => Navigator.pop(ctx, ImageSource.gallery),
+          ),
+        ],
+      ),
+    ),
+  );
+  if (src == null) return null;
+  final x =
+      await ImagePicker().pickImage(source: src, maxWidth: 800, imageQuality: 50);
+  if (x == null) return null;
+  return base64Encode(await x.readAsBytes());
+}
+
+Future<void> shareToWhatsApp(Map<String, dynamic> d) async {
+  final kind = d['type'] == 'lost' ? 'LOST' : 'FOUND';
+  final text = '$kind on campus: ${d['title']} (${d['location']}). '
+      'Is it yours? Check CampusFind.';
+  await launchUrl(
+    Uri.parse('https://wa.me/?text=${Uri.encodeComponent(text)}'),
+    mode: LaunchMode.externalApplication,
+  );
+}
+
+Widget infoBox(IconData icon, Color color, String text) {
+  return Container(
+    width: double.infinity,
+    padding: const EdgeInsets.all(14),
+    decoration: BoxDecoration(
+      color: color.withValues(alpha: 0.1),
+      borderRadius: BorderRadius.circular(16),
+      border: Border.all(color: color.withValues(alpha: 0.4)),
+    ),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(icon, color: color),
+        const SizedBox(width: 12),
+        Expanded(child: Text(text, style: const TextStyle(height: 1.4))),
+      ],
+    ),
   );
 }
 
@@ -358,6 +425,54 @@ class _HomePageState extends State<HomePage> {
           .orderBy('createdAt', descending: true)
           .snapshots();
 
+  late final Stream<DocumentSnapshot<Map<String, dynamic>>> _karma =
+      FirebaseFirestore.instance
+          .collection('users')
+          .doc(FirebaseAuth.instance.currentUser!.uid)
+          .snapshots();
+
+  Widget _karmaBadge() {
+    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+      stream: _karma,
+      builder: (context, snap) {
+        final n = ((snap.data?.data()?['karma'] ?? 0) as num).toInt();
+        return Container(
+          margin: const EdgeInsets.only(right: 4),
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          decoration: BoxDecoration(
+            color: Colors.white.withValues(alpha: 0.2),
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Text(
+            '\u2B50 $n \u00B7 ${levelFor(n)}',
+            style: const TextStyle(
+                color: Colors.white, fontWeight: FontWeight.w600, fontSize: 12),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _thumb(Map<String, dynamic> d, Color color) {
+    final photo = d['photo'] as String?;
+    if (photo != null && photo.isNotEmpty) {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(16),
+        child: Image.memory(base64Decode(photo),
+            width: 54, height: 54, fit: BoxFit.cover, gaplessPlayback: true),
+      );
+    }
+    return Container(
+      width: 54,
+      height: 54,
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Icon(iconFor('${d['title']}'), color: color, size: 28),
+    );
+  }
+
   String get _name {
     final e = FirebaseAuth.instance.currentUser?.email ?? '';
     final n = e.split('@').first;
@@ -431,6 +546,7 @@ class _HomePageState extends State<HomePage> {
                   ],
                 ),
               ),
+              _karmaBadge(),
               IconButton(
                 tooltip: 'Log out',
                 icon: const Icon(Icons.logout, color: Colors.white),
@@ -528,15 +644,7 @@ class _HomePageState extends State<HomePage> {
             padding: const EdgeInsets.all(14),
             child: Row(
               children: [
-                Container(
-                  width: 54,
-                  height: 54,
-                  decoration: BoxDecoration(
-                    color: color.withValues(alpha: 0.12),
-                    borderRadius: BorderRadius.circular(16),
-                  ),
-                  child: Icon(iconFor('${d['title']}'), color: color, size: 28),
-                ),
+                _thumb(d, color),
                 const SizedBox(width: 14),
                 Expanded(
                   child: Column(
@@ -683,6 +791,9 @@ class _ReportPageState extends State<ReportPage> {
   final _description = TextEditingController();
   final _location = TextEditingController();
   final _contact = TextEditingController();
+  final _question = TextEditingController();
+  final _answer = TextEditingController();
+  String? _photo;
   String _type = 'lost';
   bool _saving = false;
 
@@ -691,7 +802,7 @@ class _ReportPageState extends State<ReportPage> {
     setState(() => _saving = true);
     try {
       final user = FirebaseAuth.instance.currentUser!;
-      await FirebaseFirestore.instance.collection('items').add({
+      final ref = await FirebaseFirestore.instance.collection('items').add({
         'type': _type,
         'title': _title.text.trim(),
         'description': _description.text.trim(),
@@ -700,8 +811,18 @@ class _ReportPageState extends State<ReportPage> {
         'userId': user.uid,
         'userEmail': user.email,
         'resolved': false,
+        if (_photo != null) 'photo': _photo,
+        if (_type == 'found') 'question': _question.text.trim(),
         'createdAt': FieldValue.serverTimestamp(),
       });
+      if (_type == 'found') {
+        // The real answer lives in a private sub-document that only the
+        // finder can read (see firestore.rules).
+        await ref
+            .collection('private')
+            .doc('detail')
+            .set({'detail': _answer.text.trim(), 'finderId': user.uid});
+      }
       if (mounted) Navigator.pop(context);
     } catch (e) {
       if (mounted) {
@@ -722,6 +843,8 @@ class _ReportPageState extends State<ReportPage> {
     _description.dispose();
     _location.dispose();
     _contact.dispose();
+    _question.dispose();
+    _answer.dispose();
     super.dispose();
   }
 
@@ -818,6 +941,40 @@ class _ReportPageState extends State<ReportPage> {
                     'Where was it lost / found?', Icons.place_outlined),
               ),
               const SizedBox(height: 14),
+              PhotoField(
+                photo: _photo,
+                label: 'Add a photo (optional)',
+                onPick: () async {
+                  final p = await pickPhoto(context);
+                  if (p != null) setState(() => _photo = p);
+                },
+                onClear: () => setState(() => _photo = null),
+              ),
+              const SizedBox(height: 14),
+              if (_type == 'found') ...[
+                infoBox(
+                  Icons.verified_user_outlined,
+                  kPrimary,
+                  'Owner check: ask a question only the real owner can answer '
+                  '(e.g. "What is inside the front pocket?"). Keep the true '
+                  'answer private. Do not put it in the description.',
+                ),
+                const SizedBox(height: 14),
+                TextFormField(
+                  controller: _question,
+                  validator: _required,
+                  decoration: fieldDecoration(
+                      'Question for the claimant', Icons.help_outline),
+                ),
+                const SizedBox(height: 14),
+                TextFormField(
+                  controller: _answer,
+                  validator: _required,
+                  decoration: fieldDecoration(
+                      'True answer (only you can see)', Icons.lock_outline),
+                ),
+                const SizedBox(height: 14),
+              ],
               TextFormField(
                 controller: _contact,
                 validator: _required,
@@ -1000,6 +1157,17 @@ class DetailPage extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                if ('${d['photo'] ?? ''}'.isNotEmpty) ...[
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(16),
+                    child: Image.memory(base64Decode('${d['photo']}'),
+                        width: double.infinity,
+                        height: 220,
+                        fit: BoxFit.cover,
+                        gaplessPlayback: true),
+                  ),
+                  const SizedBox(height: 16),
+                ],
                 const Text('Description',
                     style:
                         TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
@@ -1053,7 +1221,24 @@ class DetailPage extends StatelessWidget {
                     ],
                   ),
                 ),
-                if (isOwner && !resolved) ...[
+                const SizedBox(height: 14),
+                OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: const Color(0xFF128C7E),
+                    minimumSize: const Size.fromHeight(52),
+                    side: const BorderSide(color: Color(0xFF128C7E)),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14)),
+                  ),
+                  onPressed: () => shareToWhatsApp(d),
+                  icon: const Icon(Icons.share),
+                  label: const Text('Share to WhatsApp'),
+                ),
+                if (!isLost && !resolved) ...[
+                  const SizedBox(height: 18),
+                  ClaimSection(item: doc.reference, data: d),
+                ],
+                if (isOwner && !resolved && isLost) ...[
                   const SizedBox(height: 20),
                   FilledButton.icon(
                     style: bigButton(kFound),
@@ -1084,6 +1269,479 @@ class DetailPage extends StatelessWidget {
               ],
             ),
           ),
+        ],
+      ),
+    );
+  }
+}
+
+// --------------------------------------------------------------- CLAIMS
+
+class PhotoField extends StatelessWidget {
+  final String? photo;
+  final String label;
+  final VoidCallback onPick;
+  final VoidCallback onClear;
+  const PhotoField({
+    super.key,
+    required this.photo,
+    required this.label,
+    required this.onPick,
+    required this.onClear,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (photo == null) {
+      return OutlinedButton.icon(
+        style: OutlinedButton.styleFrom(
+          foregroundColor: kPrimary,
+          minimumSize: const Size.fromHeight(52),
+          side: BorderSide(color: Colors.grey.shade400),
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        ),
+        onPressed: onPick,
+        icon: const Icon(Icons.add_a_photo_outlined),
+        label: Text(label),
+      );
+    }
+    return Stack(
+      children: [
+        ClipRRect(
+          borderRadius: BorderRadius.circular(14),
+          child: Image.memory(base64Decode(photo!),
+              width: double.infinity,
+              height: 180,
+              fit: BoxFit.cover,
+              gaplessPlayback: true),
+        ),
+        Positioned(
+          top: 6,
+          right: 6,
+          child: IconButton(
+            style: IconButton.styleFrom(backgroundColor: Colors.black54),
+            icon: const Icon(Icons.close, color: Colors.white),
+            onPressed: onClear,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class ClaimSection extends StatelessWidget {
+  final DocumentReference<Map<String, dynamic>> item;
+  final Map<String, dynamic> data;
+  const ClaimSection({super.key, required this.item, required this.data});
+
+  @override
+  Widget build(BuildContext context) {
+    final uid = FirebaseAuth.instance.currentUser!.uid;
+    if (uid == data['userId']) return FinderClaims(item: item);
+    return MyClaim(item: item, uid: uid, question: '${data['question'] ?? ''}');
+  }
+}
+
+/// What a non-finder sees: claim button, pending/rejected state, or the
+/// handover code once approved.
+class MyClaim extends StatelessWidget {
+  final DocumentReference<Map<String, dynamic>> item;
+  final String uid;
+  final String question;
+  const MyClaim(
+      {super.key,
+      required this.item,
+      required this.uid,
+      required this.question});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+      stream: item.collection('claims').doc(uid).snapshots(),
+      builder: (context, snap) {
+        if (!snap.hasData) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        final c = snap.data!.data();
+        if (c == null) {
+          return FilledButton.icon(
+            style: bigButton(kPrimary),
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(
+                  builder: (_) => ClaimPage(item: item, question: question)),
+            ),
+            icon: const Icon(Icons.front_hand_outlined),
+            label: const Text('This is mine'),
+          );
+        }
+        final status = c['status'];
+        if (status == 'approved') {
+          return Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(18),
+            decoration: BoxDecoration(
+              color: kFound.withValues(alpha: 0.1),
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: kFound),
+            ),
+            child: Column(
+              children: [
+                const Text('Claim approved!',
+                    style:
+                        TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 6),
+                const Text(
+                    'Meet the finder in a public place and show this code:'),
+                const SizedBox(height: 10),
+                Text('${c['handoverCode']}',
+                    style: const TextStyle(
+                        fontSize: 36,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 6,
+                        color: kFound)),
+              ],
+            ),
+          );
+        }
+        if (status == 'rejected') {
+          return infoBox(Icons.block, kLost,
+              'Your claim was not accepted. The details did not match.');
+        }
+        if (status == 'returned') {
+          return infoBox(Icons.done_all, kFound, 'This item was returned to you.');
+        }
+        return infoBox(Icons.hourglass_top, Colors.amber.shade800,
+            'Claim sent. Waiting for the finder to review it.');
+      },
+    );
+  }
+}
+
+class ClaimPage extends StatefulWidget {
+  final DocumentReference<Map<String, dynamic>> item;
+  final String question;
+  const ClaimPage({super.key, required this.item, required this.question});
+
+  @override
+  State<ClaimPage> createState() => _ClaimPageState();
+}
+
+class _ClaimPageState extends State<ClaimPage> {
+  final _answer = TextEditingController();
+  String? _photo;
+  bool _saving = false;
+
+  void _snack(String m) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(behavior: SnackBarBehavior.floating, content: Text(m)),
+    );
+  }
+
+  Future<void> _submit() async {
+    if (_answer.text.trim().isEmpty) {
+      _snack('Please answer the finder\'s question');
+      return;
+    }
+    setState(() => _saving = true);
+    try {
+      final user = FirebaseAuth.instance.currentUser!;
+      await widget.item.collection('claims').doc(user.uid).set({
+        'claimantId': user.uid,
+        'claimantEmail': user.email,
+        'answer': _answer.text.trim(),
+        if (_photo != null) 'proofPhoto': _photo,
+        'status': 'pending',
+        'createdAt': FieldValue.serverTimestamp(),
+      });
+      if (mounted) Navigator.pop(context);
+    } catch (e) {
+      if (mounted) {
+        setState(() => _saving = false);
+        _snack('Could not send claim: $e');
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _answer.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Claim this item'),
+        backgroundColor: Colors.transparent,
+        foregroundColor: Colors.white,
+        elevation: 0,
+        flexibleSpace: Container(
+          decoration: const BoxDecoration(gradient: kGradient),
+        ),
+      ),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            infoBox(
+              Icons.help_outline,
+              kPrimary,
+              widget.question.isEmpty
+                  ? 'Describe something only the real owner would know '
+                      '(marks, contents, stickers).'
+                  : widget.question,
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: _answer,
+              maxLines: 4,
+              decoration: fieldDecoration('Your answer', Icons.edit_outlined),
+            ),
+            const SizedBox(height: 14),
+            PhotoField(
+              photo: _photo,
+              label: 'Add proof photo (optional)',
+              onPick: () async {
+                final p = await pickPhoto(context);
+                if (p != null) setState(() => _photo = p);
+              },
+              onClear: () => setState(() => _photo = null),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'A photo of you with the item, or a receipt, makes your claim stronger.',
+              style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
+            ),
+            const SizedBox(height: 22),
+            FilledButton.icon(
+              style: bigButton(kPrimary),
+              onPressed: _saving ? null : _submit,
+              icon: const Icon(Icons.send),
+              label: const Text('Send claim'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// What the finder sees: their private answer next to each claim.
+class FinderClaims extends StatelessWidget {
+  final DocumentReference<Map<String, dynamic>> item;
+  const FinderClaims({super.key, required this.item});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text('Claims',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 8),
+        FutureBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+          future: item.collection('private').doc('detail').get(),
+          builder: (context, s) {
+            final a = s.data?.data()?['detail'];
+            if (a == null) return const SizedBox.shrink();
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: infoBox(Icons.lock_outline, kPrimary,
+                  'True answer (only you can see): $a'),
+            );
+          },
+        ),
+        StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+          stream: item.collection('claims').snapshots(),
+          builder: (context, s) {
+            if (!s.hasData) {
+              return const Center(child: CircularProgressIndicator());
+            }
+            final docs = s.data!.docs;
+            if (docs.isEmpty) {
+              return Text('No claims yet.',
+                  style: TextStyle(color: Colors.grey.shade600));
+            }
+            final locked = docs.any((d) => d.data()['status'] == 'approved');
+            return Column(
+              children: [
+                for (final d in docs)
+                  ClaimCard(
+                      key: ValueKey(d.id), item: item, claim: d, locked: locked),
+              ],
+            );
+          },
+        ),
+      ],
+    );
+  }
+}
+
+class ClaimCard extends StatefulWidget {
+  final DocumentReference<Map<String, dynamic>> item;
+  final QueryDocumentSnapshot<Map<String, dynamic>> claim;
+  final bool locked;
+  const ClaimCard(
+      {super.key,
+      required this.item,
+      required this.claim,
+      required this.locked});
+
+  @override
+  State<ClaimCard> createState() => _ClaimCardState();
+}
+
+class _ClaimCardState extends State<ClaimCard> {
+  final _code = TextEditingController();
+  bool _busy = false;
+
+  void _snack(String m) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(behavior: SnackBarBehavior.floating, content: Text(m)),
+    );
+  }
+
+  Future<void> _decide(bool approve) async {
+    setState(() => _busy = true);
+    try {
+      await widget.claim.reference.update({
+        'status': approve ? 'approved' : 'rejected',
+        if (approve)
+          'handoverCode': (100000 + Random().nextInt(900000)).toString(),
+      });
+    } catch (e) {
+      _snack('Could not update: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _confirm() async {
+    final c = widget.claim.data();
+    if (_code.text.trim() != '${c['handoverCode']}') {
+      _snack('That code does not match');
+      return;
+    }
+    setState(() => _busy = true);
+    try {
+      final db = FirebaseFirestore.instance;
+      final uid = FirebaseAuth.instance.currentUser!.uid;
+      final batch = db.batch();
+      batch.update(
+          widget.item, {'resolved': true, 'returnedTo': c['claimantId']});
+      batch.update(widget.claim.reference, {'status': 'returned'});
+      batch.set(
+        db.collection('users').doc(uid),
+        {'karma': FieldValue.increment(10), 'returns': FieldValue.increment(1)},
+        SetOptions(merge: true),
+      );
+      await batch.commit();
+      if (mounted) {
+        _snack('Returned! You earned +10 karma');
+        Navigator.pop(context);
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _busy = false);
+        _snack('Could not confirm: $e');
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _code.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = widget.claim.data();
+    final status = '${c['status']}';
+    final proof = c['proofPhoto'] as String?;
+    final statusColor = status == 'approved' || status == 'returned'
+        ? kFound
+        : (status == 'rejected' ? kLost : Colors.amber.shade800);
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.grey.shade200),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text('${c['claimantEmail'] ?? ''}',
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontWeight: FontWeight.w700)),
+              ),
+              pill(status.toUpperCase(), statusColor),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text('Their answer:',
+              style: TextStyle(color: Colors.grey.shade600, fontSize: 12)),
+          Text('${c['answer'] ?? ''}',
+              style: const TextStyle(fontSize: 15, height: 1.4)),
+          if (proof != null && proof.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(12),
+              child: Image.memory(base64Decode(proof),
+                  width: double.infinity,
+                  height: 160,
+                  fit: BoxFit.cover,
+                  gaplessPlayback: true),
+            ),
+          ],
+          if (status == 'pending') ...[
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: _busy ? null : () => _decide(false),
+                    child: const Text('Reject'),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: FilledButton(
+                    onPressed:
+                        (_busy || widget.locked) ? null : () => _decide(true),
+                    child: const Text('Approve'),
+                  ),
+                ),
+              ],
+            ),
+          ],
+          if (status == 'approved') ...[
+            const SizedBox(height: 12),
+            const Text('When you meet, enter the code they show you:'),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _code,
+              keyboardType: TextInputType.number,
+              maxLength: 6,
+              decoration: fieldDecoration('6-digit code', Icons.pin_outlined),
+            ),
+            FilledButton.icon(
+              style: bigButton(kFound),
+              onPressed: _busy ? null : _confirm,
+              icon: const Icon(Icons.handshake_outlined),
+              label: const Text('Confirm handover'),
+            ),
+          ],
         ],
       ),
     );
