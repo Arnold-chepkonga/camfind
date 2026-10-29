@@ -26,7 +26,8 @@ jobs:
         run: flutter create --org com.app --project-name camfind --platforms=android .
 
       - name: Add Firebase packages
-       run: flutter pub add firebase_core cloud_firestore firebase_auth image_picker url_launcher
+        run: flutter pub add firebase_core cloud_firestore firebase_auth image_picker url_launcher
+
       - name: Android settings
         run: |
           sed -i 's/flutter.minSdkVersion/23/' android/app/build.gradle*
